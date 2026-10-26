@@ -6,7 +6,11 @@
 // - first failure stops the run, nothing is retried;
 // - a step marked commit (submit/save/send) must be the last action and must
 //   declare `expect`; if the expectation times out the result is "unknown",
-//   and the caller must verify instead of sending it again.
+//   and the caller must verify instead of sending it again;
+// - an invalid AX snapshot (no screen frame, e.g. during cold start) is never
+//   used to locate, tap or prove absence; read-only waits for a valid one are
+//   bounded and honour pause;
+// - optional stable_ms makes a step's conditions hold across consecutive reads.
 
 export const MAX_STEPS = 20;
 const ACTIONS = ['tap', 'type', 'key', 'button', 'swipe', 'wait', 'assert'];
@@ -32,6 +36,23 @@ function checkCond(cond, where) {
     throw new StepError('bad_plan', `${where}: nth must be a nonnegative integer`);
   if (cond.gone !== undefined && typeof cond.gone !== 'boolean')
     throw new StepError('bad_plan', `${where}: gone must be boolean`);
+}
+
+/** expect / wait / assert accept one condition or an array (all must hold). */
+function checkConds(c, where) {
+  if (Array.isArray(c)) {
+    if (c.length < 1 || c.length > 8) throw new StepError('bad_plan', `${where}: condition list must have 1–8 items`);
+    c.forEach((x, i) => checkCond(x, `${where}[${i}]`));
+  } else checkCond(c, where);
+}
+const condList = c => (Array.isArray(c) ? c : [c]);
+
+/** How strongly a set of conditions can show an outcome: presence > absence > foreground. */
+export function verificationOf(c) {
+  const list = condList(c);
+  if (list.some(x => x.foreground == null && !x.gone)) return 'presence';
+  if (list.some(x => x.foreground == null)) return 'absence_only';
+  return 'foreground_only';
 }
 
 export class StepError extends Error {
@@ -122,10 +143,46 @@ export function brief(el) {
   return o;
 }
 
-/** Compact, model-friendly view: labelled or identified elements only. */
-export function summarize(snapshot, limit = 40) {
+const OVERLAY = /alert|dialog|sheet|popover|toast|hud|banner|activity|progress|busy|loading/i;
+const INTERACTIVE = /button|field|link|switch|toggle|slider|picker|segment|cell|tab|checkbox|menu|search|textview|stepper/i;
+const OFFSCREEN_LINES = 10;
+
+/**
+ * Compact, model-friendly view of labelled or identified elements.
+ * Order: elements matching the last satisfied conditions, overlay-like
+ * elements (alerts, sheets, HUD, loading), interactive, then the rest.
+ * Off-screen elements are grouped separately rather than silently dropped.
+ * AX presence is not proof of visibility, occlusion or tappability.
+ */
+export function summarize(snapshot, limit = 40, focus = null, offscreenLimit = OFFSCREEN_LINES) {
   const keep = snapshot.elements.filter(el => el.path !== '0' && (el.label || el.id || el.value));
-  return { count: keep.length, elements: keep.slice(0, limit).map(line), truncated: keep.length > limit };
+  const presence = (focus ?? []).filter(c => c.foreground == null && !c.gone);
+  const focused = new Set();
+  for (const c of presence) {
+    // Use the same full-tree order as matches(), including unlabelled nodes.
+    const hits = snapshot.elements.filter(el => el.path !== '0' && textMatch(el, c));
+    for (const el of c.nth === undefined ? hits : hits.slice(c.nth, c.nth + 1)) focused.add(el);
+  }
+  const isMatch = el => focused.has(el);
+  const rank = el => (isMatch(el) ? 0 : OVERLAY.test(el.type) || OVERLAY.test(el.id ?? '') ? 1 : INTERACTIVE.test(el.type) ? 2 : 3);
+  const on = [], off = [];
+  keep.forEach((el, i) => (onScreen(el, snapshot.screen) ? on : off).push({ el, i, r: rank(el) }));
+  on.sort((a, b) => a.r - b.r || a.i - b.i);
+  off.sort((a, b) => a.r - b.r || a.i - b.i);
+  const shownOn = on.slice(0, limit), shownOff = off.slice(0, offscreenLimit);
+  const out = {
+    count: keep.length,
+    elements: shownOn.map(x => line(x.el)),
+    offscreen: { count: off.length, elements: shownOff.map(x => line(x.el)) },
+    truncated: on.length > limit || off.length > offscreenLimit,
+  };
+  if (presence.length) {
+    out.matched = shownOn.concat(shownOff).filter(x => x.r === 0).slice(0, limit).map(x => line(x.el));
+    out.matched_count = keep.filter(isMatch).length;
+    out.matched_omitted = out.matched_count - out.matched.length;
+  }
+  if (out.truncated) out.omitted = Math.max(0, on.length - limit) + Math.max(0, off.length - offscreenLimit);
+  return out;
 }
 
 /** One element per line: type|label|id=..|value=..|x,y,w,h — cheap for a model to read. */
@@ -145,6 +202,9 @@ export function validatePlan(plan) {
       throw new StepError('bad_plan', `${name} must be a finite number from 0 to ${max}`);
   };
   bounded(plan.bundle_timeout_ms, 'bundle_timeout_ms');
+  bounded(plan.ax_ready_ms, 'ax_ready_ms');
+  if (plan.strict_commit !== undefined && typeof plan.strict_commit !== 'boolean')
+    throw new StepError('bad_plan', 'strict_commit must be boolean');
   if (plan.bundle !== undefined && (typeof plan.bundle !== 'string' || !plan.bundle))
     throw new StepError('bad_plan', 'bundle must be a nonempty string');
   if (plan.summary_limit !== undefined && (!Number.isInteger(plan.summary_limit) || plan.summary_limit < 1 || plan.summary_limit > 200))
@@ -158,10 +218,15 @@ export function validatePlan(plan) {
     if (kinds.length !== 1) throw new StepError('bad_plan', `step ${i}: exactly one of ${ACTIONS.join('/')}`);
     const kind = kinds[0];
     if (Array.isArray(s) || typeof s !== 'object') throw new StepError('bad_plan', `step ${i}: object required`);
-    const allowed = [kind, 'expect', 'commit', 'timeout_ms', 'settle_ms', 'label'];
+    const allowed = [kind, 'expect', 'commit', 'timeout_ms', 'settle_ms', 'stable_ms', 'label'];
     if (Object.keys(s).some(k => !allowed.includes(k))) throw new StepError('bad_plan', `step ${i}: unknown step key`);
     bounded(s.timeout_ms, `step ${i} timeout_ms`);
     bounded(s.settle_ms, `step ${i} settle_ms`);
+    bounded(s.stable_ms, `step ${i} stable_ms`, 10000);
+    if (s.stable_ms !== undefined) {
+      if (!s.expect && kind !== 'wait') throw new StepError('bad_plan', `step ${i}: stable_ms needs expect or wait`);
+      if (s.stable_ms > (s.timeout_ms ?? 5000)) throw new StepError('bad_plan', `step ${i}: stable_ms must not exceed timeout_ms`);
+    }
     if (s.commit !== undefined && typeof s.commit !== 'boolean') throw new StepError('bad_plan', `step ${i}: commit must be boolean`);
     if (s.commit && ['wait', 'assert'].includes(kind)) throw new StepError('bad_plan', `step ${i}: commit must mark an action`);
     if (kind === 'type' && (typeof s.type !== 'string' || /[^\x20-\x7e\n\t]/.test(s.type) || s.type.length > 2000))
@@ -179,8 +244,8 @@ export function validatePlan(plan) {
     if (NEEDS_EXPECT.has(kind) && !s.expect)
       throw new StepError('bad_plan', `step ${i}: ${kind} must declare expect (the state change to wait for)`);
     if (kind !== 'wait' && kind !== 'assert') lastAction = i;
-    if (kind === 'wait' || kind === 'assert') checkCond(s[kind], `step ${i} ${kind}`);
-    if (s.expect !== undefined) checkCond(s.expect, `step ${i} expect`);
+    if (kind === 'wait' || kind === 'assert') checkConds(s[kind], `step ${i} ${kind}`);
+    if (s.expect !== undefined) checkConds(s.expect, `step ${i} expect`);
     if (kind === 'tap') {
       const sel = s.tap, hasText = sel && ['id', 'label', 'labelContains', 'value'].some(k => sel[k] != null);
       if (!hasText && !(sel && sel.x != null && sel.y != null))
@@ -197,6 +262,8 @@ export function validatePlan(plan) {
     if (!s.commit) return;
     if (!s.expect) throw new StepError('bad_plan', `step ${i}: commit step must declare expect`);
     if (i !== lastAction) throw new StepError('bad_plan', `step ${i}: commit must be the last action in a plan`);
+    if (plan.strict_commit && verificationOf(s.expect) !== 'presence')
+      throw new StepError('bad_plan', `step ${i}: strict_commit needs an expect that observes a result element (not only foreground or gone)`);
   });
   return steps.map((s, i) => ({ ...s, kind: ACTIONS.find(k => s[k] !== undefined), index: i }));
 }
@@ -215,40 +282,78 @@ export function validatePlan(plan) {
 export async function runPlan(plan, t) {
   const steps = validatePlan(plan);
   const started = t.now();
-  const record = { status: 'ok', steps: [], ax_reads: 0, ax_ms: 0, actions: 0 };
-  let snap = null; // latest snapshot, reused until something acts
+  const record = { status: 'ok', steps: [], ax_reads: 0, ax_invalid_reads: 0, ax_ms: 0, actions: 0, warnings: [] };
+  const axReadyMs = plan.ax_ready_ms ?? 5000;
+  let snap = null; // latest VALID snapshot, reused until something acts
   let sent = false; // an input event of the current step may have reached the device
+  let focus = null; // conditions last observed as satisfied; shown first in the summary
 
-  const read = async () => {
+  // One AX read. An invalid tree (no screen frame) throws bad_snapshot and
+  // never replaces the last valid snapshot.
+  const readOnce = async () => {
     const a = t.now();
     const raw = await t.readAx();
     record.ax_reads++; record.ax_ms += t.now() - a;
-    snap = flattenAx(raw);
+    try { snap = flattenAx(raw); } catch (e) { if (e.code === 'bad_snapshot') { record.ax_invalid_reads++; snap = null; } throw e; }
     return snap;
+  };
+  // Read-only wait for a valid tree (cold start): bounded, honours pause,
+  // and only retries the known transient bad_snapshot case.
+  const read = async () => {
+    const deadline = t.now() + axReadyMs;
+    for (;;) {
+      try { return await readOnce(); }
+      catch (e) { if (e.code !== 'bad_snapshot' || t.now() >= deadline) throw e; }
+      if (t.paused()) throw new StepError('paused', 'paused while waiting for a valid AX snapshot');
+      await t.sleep(100);
+    }
   };
   const fresh = async () => snap ?? read();
 
-  const waitFor = async (cond, timeoutMs) => {
+  // All conditions in one observation. Foreground and AX are read only if needed.
+  const evaluate = async (list, readFn) => {
+    const needAx = list.some(c => c.foreground == null);
+    const s = needAx ? await readFn() : null;
+    const fg = list.some(c => c.foreground != null) ? await t.foreground() : null;
+    return list.every(c => (c.foreground != null ? fg === c.foreground : matches(s, c)));
+  };
+
+  // Poll until all conditions hold (for stableMs across consecutive valid reads).
+  const waitFor = async (cond, timeoutMs, stableMs = 0) => {
+    const list = condList(cond);
     const deadline = t.now() + timeoutMs;
+    let since = null, everMatched = false, lastInvalid = false;
     for (;;) {
-      if (cond.foreground != null) {
-        if ((await t.foreground()) === cond.foreground) return true;
-      } else {
-        await read();
-        if (matches(snap, cond)) return true;
-      }
-      if (t.now() >= deadline) return false;
-      await t.sleep(cond.foreground != null ? 150 : 50);
+      if (t.paused()) throw new StepError('paused', 'paused while waiting for a condition');
+      let ok = false;
+      try { ok = await evaluate(list, readOnce); lastInvalid = false; }
+      catch (e) { if (e.code !== 'bad_snapshot') throw e; lastInvalid = true; }
+      const now = t.now();
+      if (ok) {
+        everMatched = true;
+        if (since == null) since = now;
+        if (now - since >= stableMs) return { ok: true, stable_ms: Math.round(now - since) };
+      } else since = null;
+      if (now >= deadline) return { ok: false, everMatched, invalid: lastInvalid };
+      await t.sleep(list.every(c => c.foreground != null) ? 150 : 50);
     }
+  };
+  const failWait = (w, cond, code) => {
+    if (w.invalid) return new StepError('bad_snapshot', 'no valid AX snapshot before timeout; presence or absence not verified');
+    if (w.everMatched) return new StepError('unstable_result', `${JSON.stringify(cond)} appeared but did not hold for stable_ms`);
+    return new StepError(code, `${code === 'wait_timeout' ? 'condition not met' : 'expected'}: ${JSON.stringify(cond)}`);
   };
 
   try {
     if (plan.bundle) {
       // Wait briefly for the app to come forward (launch animation), then insist.
-      const ok = await waitFor({ foreground: plan.bundle }, plan.bundle_timeout_ms ?? 3000);
-      const fg = ok ? plan.bundle : await t.foreground();
-      if (!ok)
+      let w;
+      try { w = await waitFor({ foreground: plan.bundle }, plan.bundle_timeout_ms ?? 3000); }
+      catch (e) { e.step = e.code === 'paused' ? 0 : -1; throw e; }
+      if (!w.ok) {
+        const fg = await t.foreground();
         throw new StepError('wrong_app', `foreground is ${fg ?? 'unknown'}, plan expects ${plan.bundle}`, { step: -1 });
+      }
     }
     for (const s of steps) {
       if (t.paused()) { record.status = 'paused'; record.stopped_before = s.index; break; }
@@ -256,18 +361,28 @@ export async function runPlan(plan, t) {
       const entry = { i: s.index, kind: s.kind, label: s.label ?? null };
       sent = false;
       try {
-        await act(s);
+        await act(s, entry);
         if (s.expect) {
-          const ok = await waitFor(s.expect, s.timeout_ms ?? 5000);
-          if (!ok) {
+          const w = await waitFor(s.expect, s.timeout_ms ?? 5000, s.stable_ms ?? 0);
+          if (!w.ok) {
+            const e = failWait(w, s.expect, 'expect_timeout');
             if (s.commit) throw new StepError('unknown_result',
-              'commit sent but expected result not observed; verify the original action, do NOT resend');
-            throw new StepError('expect_timeout', `expected ${JSON.stringify(s.expect)} not observed`);
+              `commit sent but expected result not observed (${e.code}); verify the original action, do NOT resend`);
+            throw e;
           }
+          entry.observed = { verification: verificationOf(s.expect), ...(s.stable_ms ? { stable_ms: w.stable_ms } : {}) };
+          focus = condList(s.expect);
+        }
+        if (s.commit) {
+          record.commit = { step: s.index, sent: true, verification: verificationOf(s.expect) };
+          if (record.commit.verification !== 'presence')
+            record.warnings.push(`step ${s.index}: commit was sent but only ${record.commit.verification === 'foreground_only'
+              ? 'the app staying in foreground' : 'an element disappearing'} was observed; no result element was seen, so the business outcome is NOT verified`);
         }
       } catch (e) {
         // Once a commit action may have reached the device, any later error
-        // (lost connection, AX read failure) leaves its outcome unknown.
+        // (lost connection, AX read failure, pause) leaves its outcome unknown.
+        if (s.commit && sent) record.commit = { step: s.index, sent: true, verification: 'unknown' };
         if (s.commit && sent && e.code !== 'unknown_result') {
           const u = new StepError('unknown_result',
             `commit sent, then ${e.code ?? 'error'}: ${e.message}; verify the original action, do NOT resend`);
@@ -275,6 +390,7 @@ export async function runPlan(plan, t) {
           throw u;
         }
         e.step = s.index;
+        if (sent) e.action_sent = true;
         throw e;
       } finally {
         entry.ms = Math.round(t.now() - a);
@@ -283,15 +399,16 @@ export async function runPlan(plan, t) {
     }
   } catch (e) {
     record.status = e.code === 'unknown_result' ? 'unknown' : e.code === 'paused' ? 'paused' : 'failed';
-    if (e.code === 'paused') record.stopped_before = e.step;
+    if (e.code === 'paused') record.stopped_before = e.action_sent ? e.step + 1 : e.step;
     record.error = { code: e.code ?? 'tool_error', message: e.message, step: e.step ?? null };
+    if (e.action_sent) record.error.action_sent = true;
     if (e.candidates) record.error.candidates = e.candidates;
   }
 
-  // One final observation for the model; reuse the last snapshot if it is current.
+  // One final observation for the model; reuse the last valid snapshot if it is current.
   try {
     if (!snap) await read();
-    record.final = { foreground: await t.foreground(), ...summarize(snap, plan.summary_limit ?? 40) };
+    record.final = { foreground: await t.foreground(), ...summarize(snap, plan.summary_limit ?? 40, focus) };
   } catch (e) {
     record.final = { error: e.message };
     if (record.status === 'ok') {
@@ -299,11 +416,12 @@ export async function runPlan(plan, t) {
       record.error = { code: 'final_observation_failed', message: e.message, step: null };
     }
   }
+  if (!record.warnings.length) delete record.warnings;
   record.ax_ms = Math.round(record.ax_ms);
   record.total_ms = Math.round(t.now() - started);
   return record;
 
-  async function act(s) {
+  async function act(s, entry) {
     switch (s.kind) {
       case 'tap': {
         let nx, ny;
@@ -342,23 +460,25 @@ export async function runPlan(plan, t) {
         const norm = p => [(p[0] - sc.x) / sc.width, (p[1] - sc.y) / sc.height];
         const pts = [norm(s.swipe.from), norm(s.swipe.to)];
         if (pts.flat().some(v => !(v >= 0 && v <= 1))) throw new StepError('offscreen', 'swipe point outside screen');
+        if (t.paused()) throw new StepError('paused', 'paused before swipe was sent');
         sent = true;
-        await t.swipe(norm(s.swipe.from), norm(s.swipe.to), s.swipe.ms ?? 300);
+        await t.swipe(pts[0], pts[1], s.swipe.ms ?? 300);
         break;
       }
       case 'type': sent = true; await t.typeText(String(s.type)); break;
       case 'key': sent = true; await t.key(String(s.key)); break;
       case 'button': sent = true; await t.button(String(s.button)); break;
       case 'wait': {
-        const ok = await waitFor(s.wait, s.timeout_ms ?? 5000);
-        if (!ok) throw new StepError('wait_timeout', `condition not met: ${JSON.stringify(s.wait)}`);
+        const w = await waitFor(s.wait, s.timeout_ms ?? 5000, s.stable_ms ?? 0);
+        if (!w.ok) throw failWait(w, s.wait, 'wait_timeout');
+        entry.observed = { verification: verificationOf(s.wait), ...(s.stable_ms ? { stable_ms: w.stable_ms } : {}) };
+        focus = condList(s.wait);
         return; // no action happened, snapshot stays valid
       }
       case 'assert': {
-        const ok = s.assert.foreground != null
-          ? (await t.foreground()) === s.assert.foreground
-          : matches(await read(), s.assert);
-        if (!ok) throw new StepError('assert_failed', `assertion failed: ${JSON.stringify(s.assert)}`);
+        const list = condList(s.assert);
+        if (!(await evaluate(list, read))) throw new StepError('assert_failed', `assertion failed: ${JSON.stringify(s.assert)}`);
+        focus = list;
         return;
       }
     }

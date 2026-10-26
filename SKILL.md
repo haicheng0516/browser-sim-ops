@@ -25,7 +25,7 @@ description: 浏览器与 iOS 模拟器的通用操作方法：工具选择、�
 node "<本技能目录>/scripts/simops.mjs" doctor --udid <UDID>
 ```
 
-输出 Node 版本、Xcode、已启动的模拟器、serve-sim 是否可用、该 UDID 的镜像连接/占用/暂停状态。工具缺失就报告缺口，不反复下载、升级或重装。
+输出 Node 版本、Xcode、已启动的模拟器、serve-sim 是否可用，以及该 UDID 分层的事实：`helper`（absent/healthy/unhealthy）、`ax`（readable/no_valid_screen/unreadable，读一次界面）、`lease`、`paused`。`client_view` 固定为 `unknown`：helper 健康和 AX 可读都不能证明用户客户端真的显示了画面，要用该客户端自带的截图/面板核验，无法核验就如实说 unknown。工具缺失就报告缺口，不反复下载、升级或重装。
 
 | 场景 | 首选 | 补充 |
 |---|---|---|
@@ -80,12 +80,14 @@ node "$S" stop  --udid <UDID> --owner <任务名>     # 释放；只关闭自己
 ```json
 {
   "bundle": "com.example.app",
+  "strict_commit": true,
   "steps": [
     {"label": "打开设置页", "tap": {"id": "settings_button"}, "expect": {"id": "settings_title"}},
     {"label": "聚焦名称", "tap": {"type": "TextField", "label": "名称"}, "expect": {"label": "完成"}},
     {"label": "输入", "type": "example"},
     {"wait": {"type": "TextField", "value": "example"}, "timeout_ms": 3000},
-    {"label": "提交", "tap": {"label": "提交"}, "expect": {"label": "提交成功"}, "commit": true, "timeout_ms": 8000}
+    {"label": "提交", "tap": {"label": "提交"}, "commit": true, "timeout_ms": 8000, "stable_ms": 500,
+     "expect": [{"label": "提交成功"}, {"labelContains": "加载", "gone": true}]}
   ]
 }
 ```
@@ -93,16 +95,21 @@ node "$S" stop  --udid <UDID> --owner <任务名>     # 释放；只关闭自己
 - 动作：`tap`、`type`（仅美式键盘 ASCII）、`key`（enter/backspace/tab/escape/space）、`button`（当前仅 home）、`swipe`（`{"from":[x,y],"to":[x,y]}`，单位为点）、`wait`、`assert`。
 - 定位：`id`（最稳，优先）、`label`、`labelContains`、`value`，可加 `type`、`nth`。找不到、找到多个、被禁用、不在屏幕内都会直接报错，不猜。坐标 `{"x":..,"y":..}` 只在没有可用元素时用。
 - `tap`/`button`/`swipe`/`key` 必须写 `expect`：动作后要等到的明确状态（元素出现、`"gone": true` 消失，或 `{"foreground": bundleId}`）。不用固定 sleep。
-- `expect`/`wait`/`assert` 必须含 `id`、`label`、`labelContains`、`value`、`foreground` 之一，只允许这些键加 `type`/`nth`/`gone`；写错键名会直接拒绝整个计划。`foreground` 必须单独使用，不能和元素条件混合；需要两者时另加 `assert`/`wait`。`nth` 为从 0 开始的匹配序号，`gone` 检查该序号是否不存在。
+- `expect`/`wait`/`assert` 可以是一个条件，也可以是 1–8 个条件的数组（全部同时成立才算满足，例如“结果出现”且“加载遮罩消失”）。每个条件必须含 `id`、`label`、`labelContains`、`value`、`foreground` 之一，只允许这些键加 `type`/`nth`/`gone`；写错键名会直接拒绝整个计划。`foreground` 在单个条件对象里必须单独出现，需要和元素一起判断时放进数组。`nth` 为从 0 开始的匹配序号，`gone` 检查该序号是否不存在。
+- `stable_ms`（可选，0–10000，不超过 `timeout_ms`）：条件要在连续的有效读取中保持至少这么久才算满足；中途不成立就重新计时。用于转场时新旧页面同时出现、结果一闪而过、截图仍在 Loading 的场景。只看你写的条件，时钟、进度等无关元素变化不影响它；不写就是旧行为（第一次满足即返回）。哪些遮罩/HUD 必须消失由你写进条件，工具不猜。
+- `ax_ready_ms`（计划级，默认 5000）：App 已到前台但无障碍树还没有有效屏幕尺寸（冷启动常见）时，只读等待的上限。期间响应暂停；只有拿到有效快照才定位、点击；无效快照永远不能证明 `gone` 成立。到时间仍无效则报 `bad_snapshot` 失败。不会重启 App、模拟器、SpringBoard 或 helper。
 - `timeout_ms` 默认 5000，范围 0–60000；`settle_ms` 和 `bundle_timeout_ms` 同样有上限。超时包含条件轮询，但单次底层读可能再占用其请求超时（最多 10 秒），不是精确总时长上限。
 - `type` 后加一个 `wait` 核对输入框的 value。
-- `commit: true` 标记提交、保存、发送类动作（包括用回车提交）：只能是计划里最后一个动作，必须有 `expect`。动作发出后，无论是没等到结果还是连接/读取出错，都报 `unknown`。
+- `commit: true` 标记提交、保存、发送类动作（包括用回车提交）：只能是计划里最后一个动作，必须有 `expect`。动作发出后，无论是没等到结果、结果不稳定、快照无效、暂停还是连接/读取出错，都报 `unknown`。
+- 提交的验证强度看 `expect`：含一个要出现的元素是 `presence`；只有 `gone` 是 `absence_only`；只有 `foreground` 是 `foreground_only`。后两者在默认模式下照常执行（兼容旧计划），但结果里会有 `commit.verification` 和 `warnings`，说明**没有观察到业务结果**；App 还在前台不等于提交成功、也不等于页面已转场。计划设 `"strict_commit": true` 时，非 `presence` 的提交在执行前就被拒绝（退出码 2）。新计划建议都开严格模式。
 - `bundle` 只在计划开始等待并检查目标 App 前台（默认 3 秒），不符就一步也不执行；它不锁定前台应用，执行期间不得从其他入口切换设备或并发输入。
 - 点击前会连续读到目标位置不变才点（实测页面刚加载或转场时点击会落到别的控件上）。
 
 ### 3.4 读结果
 
-`run` 输出 JSON：`status`、每步耗时、读界面次数、最终界面摘要。只有这一份最终观察，需要视觉核验时再加 `--screenshot`。
+`run` 输出 JSON：`status`、每步耗时和 `observed`（验证强度、实际稳定时长）、读界面次数（`ax_invalid_reads` 为无效快照次数）、提交步骤的 `commit`、`warnings`、最终界面摘要。`--screenshot` 在计划写明的终态观察完成后才截图；需要等转场或遮罩消失时，把条件和 `stable_ms` 写进最后一步，而不是加固定 sleep。
+
+最终摘要 `final`：`matched` 是命中最后一个已满足条件的元素（保留 `nth` 序号，最多 `summary_limit` 条；`matched_count` / `matched_omitted` 报告匹配总数和未展示数）；`elements` 按“命中元素 → 弹窗/HUD/加载类 → 可交互元素 → 其他”排序，只含屏幕内元素；屏幕外元素放在 `offscreen`（数量和前 10 条）；`truncated`/`omitted` 如实标出省略了多少，需要查看更多时用 `ax --limit 200`，该命令的屏幕内、屏幕外两组各最多返回指定条数；仍有省略时再按需增大 N（`ax --limit N`）。AX 里存在不代表画面上可见、未被遮挡或可点击。
 
 | status | 退出码 | 怎么办 |
 |---|---|---|
@@ -111,7 +118,7 @@ node "$S" stop  --udid <UDID> --owner <任务名>     # 释放；只关闭自己
 | `unknown` | 3 | 提交已发出但没看到结果：只读回原动作的结果（刷新列表、查记录），**绝不重发** |
 | `error` | 2 | 参数或计划写错，一步都没执行 |
 | `error` | 4 | 设备被占用或有命令锁；根据错误信息核实占用方 |
-| `paused` | 5 | 用户暂停；检查 `stopped_before` / `error.step`；定位中可在输入前停下，已经发送的操作无法撤回 |
+| `paused` | 5 | 用户暂停；检查 `stopped_before` / `error.step`；定位或等待中都会停下；`error.action_sent: true` 表示该步动作已发出、只是没等结果，无法撤回 |
 
 ## 4. 合并与停止的边界
 

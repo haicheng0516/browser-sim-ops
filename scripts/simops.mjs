@@ -188,8 +188,26 @@ async function cmdDoctor(o) {
     state_dir: '$SIMOPS_STATE_DIR or $XDG_STATE_HOME/browser-sim-ops',
   };
   if (o.udid) {
-    const h = await helperFor(o.udid);
-    report.device = { udid: o.udid, helper: h ? { pid: h.pid, url: h.url } : null, lease: readJson(leaseFile(o.udid)), paused: fs.existsSync(pauseFile(o.udid)) };
+    // Separate facts: helper process/health, AX readability, lease, pause.
+    // Whether a user's client actually shows the mirror is not observable here.
+    let h = null, helper;
+    try { h = await helperFor(o.udid); helper = h ? { state: 'healthy', pid: h.pid, url: h.url } : { state: 'absent' }; }
+    catch (e) { helper = { state: 'unhealthy', error: e.message }; }
+    let ax = { state: 'not_checked' };
+    if (h) {
+      const a = performance.now();
+      try {
+        const r = await fetch(`${h.http}/ax`, { signal: AbortSignal.timeout(10000) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const snap = flattenAx(await r.json());
+        ax = { state: 'readable', elements: snap.elements.length };
+      } catch (e) { ax = { state: e.code === 'bad_snapshot' ? 'no_valid_screen' : 'unreadable', error: e.message }; }
+      ax.ms = Math.round(performance.now() - a);
+    }
+    report.device = {
+      udid: o.udid, helper, ax, lease: readJson(leaseFile(o.udid)), paused: fs.existsSync(pauseFile(o.udid)),
+      client_view: { state: 'unknown', note: 'helper health and AX do not show what a client displays; check the mirror or panel with that client\'s own screenshot tool' },
+    };
   }
   report.ready = report.node_ok && !!report.xcode && !!ss;
   out(report);
@@ -242,12 +260,14 @@ async function cmdStart(o) {
 
 async function cmdAx(o) {
   need(o, 'udid');
+  const limit = o.limit === undefined ? 60 : Number(o.limit);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw usage('--limit must be a positive safe integer');
   const h = await helperFor(o.udid);
   if (!h) throw Object.assign(new Error('no serve-sim helper for this UDID; run start first'), { exit: EXIT.failed });
   const t0 = performance.now();
   const raw = await (await fetch(`${h.http}/ax`, { signal: AbortSignal.timeout(10000) })).json();
   const fg = await (await fetch(`${h.http}/foreground`, { signal: AbortSignal.timeout(5000) })).json().catch(() => ({}));
-  out({ foreground: fg.bundleId ?? null, ax_ms: Math.round(performance.now() - t0), ...summarize(flattenAx(raw), Number(o.limit) || 60) });
+  out({ foreground: fg.bundleId ?? null, ax_ms: Math.round(performance.now() - t0), ...summarize(flattenAx(raw), limit, null, limit) });
 }
 
 async function cmdRun(o) {
