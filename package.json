@@ -1,0 +1,11 @@
+{
+  "name": "browser-sim-ops",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent skill: fewer screenshots and round trips for browser and iOS Simulator operations, without skipping verification.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "bin": { "simops": "scripts/simops.mjs" },
+  "scripts": { "test": "node --test tests/*.test.mjs" }
+}

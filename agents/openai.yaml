@@ -1,0 +1,4 @@
+interface:
+  display_name: "浏览器与模拟器操作"
+  short_description: "按元素定位、合并已确认步骤、失败即停的浏览器/iOS 模拟器操作"
+  default_prompt: "使用 $browser-sim-ops 在指定 UDID 的模拟器或当前浏览器页面里执行并核验这些已确认的操作。"

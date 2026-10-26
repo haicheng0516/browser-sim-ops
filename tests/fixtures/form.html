@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ops Bench Form</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --muted:#666; --line:#ddd; --accent:#2563eb; --err:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --muted:#aaa; --line:#333; --accent:#60a5fa; --err:#f87171; } }
+  body { margin:0; padding:24px 16px; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:420px; margin:0 auto; }
+  label { display:block; margin:12px 0 4px; }
+  input[type=text], select { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--line); border-radius:6px; background:transparent; color:inherit; font:inherit; }
+  button { margin-top:16px; padding:8px 16px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  .err { color:var(--err); min-height:1.5em; }
+  .muted { color:var(--muted); font-size:14px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>本地操作测试页</h1>
+  <p class="muted">仅用于浏览器操作对比。所有数据只留在本页内存，不发送任何网络请求。</p>
+
+  <section id="step1" aria-label="第一步">
+    <h2>第一步：基本信息</h2>
+    <label for="name">名称</label><input id="name" type="text" autocomplete="off">
+    <label for="sample-id">测试编号</label><input id="sample-id" type="text" inputmode="numeric" autocomplete="off">
+    <label for="category">类别</label>
+    <select id="category"><option value="">请选择</option><option value="A">选项 A</option><option value="B">选项 B</option></select>
+    <label><input id="agree" type="checkbox"> 我已阅读测试说明</label>
+    <div class="err" id="err1" role="alert"></div>
+    <button id="next" type="button">下一步</button>
+  </section>
+
+  <section id="step2" aria-label="第二步" hidden>
+    <h2>第二步：确认</h2>
+    <p id="summary"></p>
+    <label for="quantity">数量</label><input id="quantity" type="text" inputmode="numeric" autocomplete="off">
+    <div class="err" id="err2" role="alert"></div>
+    <button id="submit" type="button">提交</button>
+  </section>
+
+  <section id="result" aria-label="结果" hidden>
+    <h2 id="result-title">提交成功</h2>
+    <p>编号 <strong id="ref"></strong></p>
+    <p class="muted">提交次数 <span id="count">0</span> · 从页面加载到提交完成 <span id="elapsed"></span> ms</p>
+  </section>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const slow = params.has('slow');        // ?slow  → result appears after 6 s (tests unknown-result handling)
+  let submits = 0;
+  $('next').addEventListener('click', () => {
+    const name = $('name').value.trim(), sampleId = $('sample-id').value.trim(), c = $('category').value;
+    if (!name || !/^\d{10,11}$/.test(sampleId) || !c || !$('agree').checked) {
+      $('err1').textContent = '请完整填写：名称、10–11位测试编号、类别并勾选说明'; return;
+    }
+    $('err1').textContent = '';
+    $('summary').textContent = `${name} · ${sampleId} · ${c === 'A' ? '选项 A' : '选项 B'}`;
+    $('step1').hidden = true; $('step2').hidden = false;
+  });
+  $('submit').addEventListener('click', () => {
+    const quantity = $('quantity').value.trim();
+    if (!/^\d+$/.test(quantity)) { $('err2').textContent = '数量必须是数字'; return; }
+    submits++;
+    $('submit').disabled = true;
+    const done = () => {
+      $('step2').hidden = true; $('result').hidden = false;
+      $('ref').textContent = 'DEMO-' + String(Date.now()).slice(-6);
+      $('count').textContent = submits;
+      $('elapsed').textContent = Math.round(performance.now());
+    };
+    slow ? setTimeout(done, 6000) : done();
+  });
+</script>
+</body>
+</html>
