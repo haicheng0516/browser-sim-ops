@@ -232,7 +232,11 @@ async function cmdStart(o) {
   const t0 = performance.now();
   let h, startedNow = false, attempted = false;
   try {
+    if (lease.started_helper && (!Number.isInteger(lease.helper_pid) || lease.helper_pid <= 1))
+      throw new Error('invalid owned helper PID; lease retained');
     h = await helperFor(o.udid);
+    if (lease.started_helper && alive(lease.helper_pid) && (!h || h.pid !== lease.helper_pid))
+      throw new Error('owned PID is still alive but helper identity changed or metadata is missing; lease retained');
     if (!h) {
       attempted = true;
       fs.writeFileSync(lf, JSON.stringify({ ...lease, start_pending: true }), { mode: 0o600 });
