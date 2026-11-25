@@ -25,13 +25,13 @@ description: 浏览器与 iOS 模拟器的通用操作方法：工具选择、�
 node "<本技能目录>/scripts/simops.mjs" doctor --udid <UDID>
 ```
 
-输出 Node 版本、Xcode、已启动的模拟器、serve-sim 是否可用，以及该 UDID 分层的事实：`helper`（absent/healthy/unhealthy）、`ax`（readable/no_valid_screen/unreadable，读一次界面）、`lease`、`paused`。`client_view` 固定为 `unknown`：helper 健康和 AX 可读都不能证明用户客户端真的显示了画面，要用该客户端自带的截图/面板核验，无法核验就如实说 unknown。工具缺失就报告缺口，不反复下载、升级或重装。
+输出 Node 版本、Xcode、已启动的模拟器、serve-sim 是否可用，以及该 UDID 分层的事实：`helper`（absent/healthy/unhealthy）、`ax`（readable/no_valid_screen/unreadable，读一次界面）、`lease`、`paused`。`client_view` 固定为 `unknown`：helper 健康和 AX 可读都不能证明用户客户端真的显示了画面，用户要看画面时才用该客户端自带的截图/面板核验，平时保持 unknown，不影响操作。工具缺失就报告缺口，不反复下载、升级或重装。
 
 | 场景 | 首选 | 补充 |
 |---|---|---|
 | 网页 | 当前平台的浏览器工具，按 DOM/无障碍元素（ref、选择器）操作 | 布局、视觉、无法定位的控件才截图或用坐标 |
-| iOS 模拟器（App 原生控件） | `simops`：一次 run 内复用一条连接，按无障碍 id/label 定位，原生 HID 输入 | 平台自带模拟器工具截图/输入；Computer Use 只用于未知界面 |
-| 未知界面、桌面窗口 | 先读结构；读不到再截图 | Computer Use |
+| iOS 模拟器（App 原生控件） | `simops`：一次 run 内复用一条连接，按无障碍 id/label 定位，原生 HID 输入 | 平台自带模拟器工具截图/输入（能指定 UDID、不弹窗口的） |
+| 未知界面、桌面窗口 | 先读结构；读不到再截图 | Computer Use（模拟器除外，它要可见窗口） |
 
 Claude Code 和 Codex 都可读取本技能并通过其授权的 Shell 调用脚本。浏览器连接、模拟器面板和工具名取决于客户端、插件及版本，不是本技能附带的能力。没有相应工具时说明缺口，按用户要求配置后再操作；不能通过本脚本绕过客户端规定的工具入口。
 
@@ -129,7 +129,7 @@ node "$S" unlock --udid <UDID> --owner <任务名>    # 仅当命令被强杀留
 - 可以合并：同一页上已确认的填写、选择；已走通过、每步都有 `expect` 的固定导航。
 - 不能合并：第一次见到的页面、未知选项、权限弹窗、登录/验证码、跨越提交的多步业务流程。提交单独一段，提交后先核实。
 - **定位失败且输入未发出**（找不到、匹配到多个元素、不可见/被遮挡；工具在发送前就拒绝，如 Playwright `strict mode violation`、simops 定位报错且 `action_sent` 不为 true）：不是停点，也不算重试已执行的动作。先只读当前页面（快照/无障碍树），把定位收窄到已核实的唯一元素（限定已观察到的父容器、唯一 ref/id/属性，或核对过位置的 `nth`），重新定位一次再执行；收窄后仍不唯一、元素不存在或页面与预期不符，才停下。
-- **模拟器窗口不可用且输入未发出**（Computer Use 报 `noWindowsAvailable`、找不到 Simulator 窗口或窗口不是目标设备）：也不是停点。只恢复目标 UDID 的窗口：`open -a Simulator` 切到前台；仍没有该设备窗口，就从 Simulator 菜单 File > Open Simulator 选该设备打开，读回窗口标题对应目标设备；窗口按设备名显示，先用 `xcrun simctl list devices` 确认该名只对应目标 UDID，不唯一就停。恢复期间仍持有原设备与输入租约。不 boot 或新建其他设备，不关其他窗口。然后重新截图/读取、定位，重试原操作一次；仍不可用才停下并附原报错。开始一段模拟器操作前先做同样的窗口检查，只有设备在运行、没有窗口不算就绪。IDB 不是本技能依赖：Xcode 27 上 idb_companion 1.1.8 加载 SimulatorKit 时崩溃，不能输入，不作为备用输入通道。
+- **模拟器只在后台用**：没启动就 `xcrun simctl boot <UDID>`，不开 Simulator.app 窗口、不 `open -a Simulator`、不切前台、不抢焦点；没有窗口不影响操作，simops 和 `xcrun simctl io <UDID> screenshot` 都不需要窗口。只有用户要看画面或指明用窗口时才开。需要可见窗口的工具（如 Computer Use 报 `noWindowsAvailable`）不是停点也不去开窗口：输入未发出就改用 simops 等能指定 UDID 的后台工具重新读取、定位，再执行一次；没有后台工具就说明缺口。不新建其他设备。IDB 不是本技能依赖：Xcode 27 上 idb_companion 1.1.8 加载 SimulatorKit 时崩溃，不能输入，不作为备用输入通道。
 - 输入已发出后的错误、超时、结果不明，页面与预期不符，以及用户暂停：停下，不继续依赖它的动作，不自动重试。
 - 暂停：`node "$S" pause --udid <UDID>`（或在 `--pause-file` 指定的文件存在时）会在下一步开始前停止；每次发送输入前、定位和等待期间、长文本每 16 个字符、滑动的每个移动点都会检查；滑动中途停下会先抬起手指，文本只按整个按键停下。已经发出的部分无法撤回，要如实说明。暂停是用户的决定：只有用户明确要求继续时才执行 `resume`；`stop`/`start` 不会清除暂停。
 - 在途中被中断（Ctrl-C / 平台停止）第一次按暂停处理，在上述检查点停下；第二次立即退出，按结果未知处理。SIGKILL 和崩溃无法清理，可能留下锁（用 `unlock` 按上文规则恢复）。
