@@ -95,3 +95,54 @@ export async function stopOwnedHelper(lease, { alive, identity, readState, termi
   }
   throw new Error(`helper pid ${pid} is still running; lease retained`);
 }
+
+// A lease of another owner is reclaimed only when every check proves nobody
+// is using it; anything that cannot be decided counts as "in use".
+// Returns { ok, passed: [...], failed: [...] } with one plain reason per check.
+export function reclaimCheck(lease, { base, udid, alive, startOf, clock, idleMs, now = Date.now() }) {
+  const passed = [], failed = [];
+  const check = (ok, why) => (ok ? passed : failed).push(why);
+  // 1. the helper this lease registered is confirmed gone
+  const pid = lease.helper_pid;
+  if (lease.start_pending) check(false, 'helper start outcome is unknown (start_pending)');
+  else if (!Number.isInteger(pid) || pid <= 1) check(false, 'lease has no helper_pid (old format or borrowed helper); cannot tell whether the helper is gone');
+  else if (!alive(pid)) check(true, `registered helper pid ${pid} has exited`);
+  else if (lease.helper_started && lease.start_clock === clock) {
+    const started = startOf(pid);
+    if (!started) check(false, `cannot read the start time of registered helper pid ${pid}`);
+    else if (started !== lease.helper_started) check(true, `registered helper pid ${pid} now belongs to a newer process`);
+    else check(false, `registered helper pid ${pid} is still running`);
+  } else check(false, `registered helper pid ${pid} is alive and its start time cannot be compared`);
+  // 2. no command lock held by that owner (this device's lock is ours)
+  const dir = path.join(base, 'locks');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (e) { if (e.code !== 'ENOENT') check(false, `cannot read command locks: ${e.message}`); }
+  const blocking = [];
+  for (const name of names) {
+    if (name === udid || name.endsWith('.transition')) continue;
+    const holder = readHolder(path.join(dir, name));
+    if (!holder) blocking.push(`${name} (unreadable holder)`);
+    else if (holder.owner === lease.owner) blocking.push(`${name} (${holder.command})`);
+  }
+  check(!blocking.length, blocking.length ? `command lock present: ${blocking.join(', ')}` : 'no command lock held by that owner');
+  // 3 and 4. idle window
+  const minutes = Math.round(idleMs / 60000 * 10) / 10;
+  if (!Number.isFinite(idleMs) || idleMs <= 0) {
+    check(false, 'idle window is invalid (SIMOPS_RECLAIM_IDLE_MIN must be a positive number of minutes)');
+    return { ok: false, passed, failed };
+  }
+  let last = null, logOk = true;
+  try {
+    for (const line of fs.readFileSync(path.join(base, 'runs.jsonl'), 'utf8').split('\n')) {
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      const t = Date.parse(r?.at);
+      if (r?.owner === lease.owner && Number.isFinite(t) && (last === null || t > last)) last = t;
+    }
+  } catch (e) { if (e.code !== 'ENOENT') { logOk = false; check(false, `cannot read runs.jsonl: ${e.message}`); } }
+  if (logOk) check(last === null || now - last >= idleMs,
+    last === null ? 'no activity of that owner in runs.jsonl' : `last activity of that owner at ${new Date(last).toISOString()} (${now - last >= idleMs ? 'more' : 'less'} than ${minutes} min ago)`);
+  const acquired = Date.parse(lease.acquired_at);
+  if (!Number.isFinite(acquired)) check(false, 'lease acquired_at is missing or unreadable');
+  else check(now - acquired >= idleMs, `lease acquired at ${lease.acquired_at} (${now - acquired >= idleMs ? 'more' : 'less'} than ${minutes} min ago)`);
+  return { ok: !failed.length, passed, failed };
+}
