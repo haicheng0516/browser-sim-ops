@@ -13,6 +13,9 @@
 //
 // Exit codes: 0 ok, 1 failed, 2 usage/plan error, 3 unknown result (verify, do
 // not resend), 4 device busy/lease mismatch, 5 paused.
+//
+// start/run reclaim another owner's lease only when it is provably abandoned
+// (see reclaimAbandoned); SIMOPS_RECLAIM_IDLE_MIN sets the idle window (default 30).
 
 import { spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -20,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { runPlan, validatePlan, flattenAx, summarize, StepError } from './lib/engine.mjs';
 
-import { withDeviceLock, stopOwnedHelper, unlockStale } from './lib/lifecycle.mjs';
+import { withDeviceLock, stopOwnedHelper, unlockStale, reclaimCheck } from './lib/lifecycle.mjs';
 
 const EXIT = { ok: 0, failed: 1, usage: 2, unknown: 3, busy: 4, paused: 5 };
 
@@ -264,6 +267,30 @@ async function openTransport(h, pausePath) {
   };
 }
 
+// ---------- reclaiming an abandoned lease ----------
+// Another owner's lease is taken over only when its registered helper is
+// confirmed gone, that owner holds no command lock, has no run within the idle
+// window and the lease itself is older than that window. Called with this
+// device's command lock held, so no other simops command can change the lease.
+const DEFAULT_IDLE_MIN = 30;
+function idleWindowMs() {
+  const raw = process.env.SIMOPS_RECLAIM_IDLE_MIN;
+  return (raw === undefined || raw === '' ? DEFAULT_IDLE_MIN : Number(raw)) * 60000;
+}
+function reclaimAbandoned(o, lease, command) {
+  const check = reclaimCheck(lease, { base: stateDir(), udid: o.udid, alive, startOf: processStart, clock: START_CLOCK, idleMs: idleWindowMs() });
+  if (!check.ok)
+    throw Object.assign(new Error(`device leased by "${lease.owner}" since ${lease.acquired_at}; not reclaimed because: ${check.failed.join('; ')}. Ask that owner to stop, do not take over`),
+      { exit: EXIT.busy, holder: lease, reclaim: { refused: check.failed, passed: check.passed } });
+  const reclaimed = { from_owner: lease.owner, lease_acquired_at: lease.acquired_at ?? null, helper_pid: lease.helper_pid, reasons: check.passed };
+  // Record first: an unlogged takeover is not allowed.
+  fs.appendFileSync(path.join(stateDir(), 'runs.jsonl'), JSON.stringify({
+    at: new Date().toISOString(), udid: o.udid, owner: o.owner, event: 'reclaim', command, ...reclaimed, previous_lease: lease,
+  }) + '\n', { mode: 0o600 });
+  fs.rmSync(leaseFile(o.udid), { force: true });
+  return reclaimed;
+}
+
 // ---------- commands ----------
 
 async function cmdDoctor(o) {
@@ -308,9 +335,9 @@ async function cmdStart(o) {
   if (!bootedDevices().some(d => d.udid === o.udid)) throw Object.assign(new Error(`simulator ${o.udid} is not booted`), { exit: EXIT.failed });
   const lf = leaseFile(o.udid);
   const busy = l => Object.assign(new Error(`device leased by "${l.owner}" since ${l.acquired_at}; ask that owner to stop, do not take over`), { exit: EXIT.busy, holder: l });
-  let lease = readJson(lf), created = false;
+  let lease = readJson(lf), created = false, reclaimed = null;
   if (!lease && fs.existsSync(lf)) throw new Error('lease file is unreadable or invalid; inspect it before proceeding');
-  if (lease && lease.owner !== o.owner) throw busy(lease);
+  if (lease && lease.owner !== o.owner) { reclaimed = reclaimAbandoned(o, lease, 'start'); lease = null; }
   if (lease?.start_pending) throw new Error('previous helper start outcome is unknown; inspect state before starting again');
   if (!lease) {
     // Claim atomically before touching the device; a concurrent start loses here.
@@ -364,7 +391,7 @@ async function cmdStart(o) {
   const rec = { ...lease, start_pending: false, started_helper: owns, helper_pid: owns ? h.pid : null,
     helper_started: owns ? hStarted : null, start_clock: START_CLOCK, helper_command: owns ? helperCommand : null };
   fs.writeFileSync(lf, JSON.stringify(rec, null, 2));
-  out({ status: 'ok', reused_helper: !startedNow, started_helper: owns, helper_pid: h.pid, url: h.url, start_ms: Math.round(performance.now() - t0) });
+  out({ status: 'ok', ...(reclaimed ? { reclaimed } : {}), reused_helper: !startedNow, started_helper: owns, helper_pid: h.pid, url: h.url, start_ms: Math.round(performance.now() - t0) });
 }
 
 async function cmdAx(o) {
@@ -395,12 +422,19 @@ function preparePlan(o) {
 }
 
 async function cmdRun(o, plan) {
-  const lease = readJson(leaseFile(o.udid));
-  if (!lease || lease.owner !== o.owner)
-    throw Object.assign(new Error(lease ? `device leased by "${lease.owner}", not "${o.owner}"` : 'no lease for this device; run start first'), { exit: EXIT.busy });
+  const lf = leaseFile(o.udid);
+  const lease = readJson(lf);
+  if (!lease) throw Object.assign(new Error(fs.existsSync(lf) ? 'lease file is unreadable or invalid; inspect it before proceeding' : 'no lease for this device; run start first'), { exit: EXIT.busy });
+  let reclaimed = null;
+  if (lease.owner !== o.owner) {
+    reclaimed = reclaimAbandoned(o, lease, 'run');
+    // The new lease borrows whatever helper runs now; it never owns one.
+    fs.writeFileSync(lf, JSON.stringify({ owner: o.owner, udid: o.udid, acquired_at: new Date().toISOString(), started_helper: false, helper_pid: null,
+      start_pending: false, helper_started: null, start_clock: START_CLOCK, helper_command: null }, null, 2), { flag: 'wx', mode: 0o600 });
+  }
   if (o['pause-file']) process.env.SIMOPS_PAUSE_FILE = o['pause-file'];
   const h = await helperFor(o.udid);
-  if (!h) throw Object.assign(new Error('serve-sim helper not running for this UDID; run start again'), { exit: EXIT.failed });
+  if (!h) throw Object.assign(new Error(`serve-sim helper not running for this UDID; run start again${reclaimed ? ` (lease reclaimed from "${reclaimed.from_owner}" and now held by "${o.owner}")` : ''}`), { exit: EXIT.failed, ...(reclaimed ? { reclaimed } : {}) });
   const t = await openTransport(h, pauseFile(o.udid));
   activeTransport = t;
   let result;
@@ -420,7 +454,7 @@ async function cmdRun(o, plan) {
       steps: result.steps.map(s => ({ i: s.i, kind: s.kind, ms: s.ms })),
     }) + '\n', { mode: 0o600 });
   } catch { /* logging is best effort */ }
-  out(result);
+  out(reclaimed ? { reclaimed, ...result } : result);
   process.exitCode = EXIT[result.status] ?? EXIT.failed;
 }
 
@@ -482,6 +516,6 @@ try {
     await withDeviceLock(stateDir(), o.udid, o._, o.owner, release => { releaseLock = release; return fn(o, plan); }, { started: processStart(process.pid), start_clock: START_CLOCK });
   } else await fn(o);
 } catch (e) {
-  out({ status: 'error', error: e.message, ...(e.holder ? { holder: e.holder } : {}) });
+  out({ status: 'error', error: e.message, ...(e.holder ? { holder: e.holder } : {}), ...(e.reclaim ? { reclaim: e.reclaim } : {}), ...(e.reclaimed ? { reclaimed: e.reclaimed } : {}) });
   process.exitCode = e.exit ?? EXIT.failed;
 } finally { untrap?.(); }

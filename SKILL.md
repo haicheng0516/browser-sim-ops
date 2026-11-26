@@ -69,6 +69,7 @@ node "$S" unlock --udid <UDID> --owner <任务名>    # 仅当命令被强杀留
 ```
 
 - 设备被其他 owner 占用、或任何 owner 已有 `start/run/stop` 命令持锁时直接拒绝（退出码 4）：不接管、不抢占，去找占用方。
+- 唯一例外是无主占用自动收回：`start` / `run` 遇到别的 owner 的占用，四条全满足才收回再继续：①该占用登记的 helper 已确认不在（PID 不存在，或同 PID 的启动时间已变；判断不了不收，没有 `helper_pid` 的旧格式或借用 helper 的占用按判断不了处理）；②该 owner 没有任何命令锁；③该 owner 在 `runs.jsonl` 里最近一段时间没有动作；④占用登记也超过同样时长。时长默认 30 分钟，可用 `SIMOPS_RECLAIM_IDLE_MIN`（分钟）调整。收回时输出 `reclaimed`（原 owner、登记时间、helper PID、理由），并在 `runs.jsonl` 记一行 `event: "reclaim"`（含原占用全文）；`run` 收回后新占用只借用现有 helper。不满足就照旧拒绝，`reclaim.refused` 列出不满足的条。不要用别人的 owner 名去 `stop` 或 `unlock`。
 - `stop` 只停止本 owner 启动的 helper：发信号前核对可执行位置或 Node、Python、sh/bash/zsh 紧随其后的脚本位置中的完整 `serve-sim` / `serve-sim.js` 路径，或该位置中的 lease 自定义包装路径及完整 UDID 参数（不把后续数据参数当作程序；解释器选项、路径引号等不明确格式拒绝）；登记过启动时间则必须可比且相同，随后核实进程退出。启动路径保存在原 lease，后续不依赖 `SIMOPS_SERVE_SIM` 仍然存在。PID 不存在或可比启动时间不同才视为原 helper 已退出；存活进程身份无法确认、时间不可读或不可比时保留 lease 并报错，旧 lease 同样保守处理。借用的 helper 不关闭；再次 `start` 也不得丢掉自己登记的存活 helper 的清理责任。
 - 命令锁只协调本脚本且同状态目录的进程，不限制外部工具；使用其他工具前也须确认设备占用与交接。命令被强杀（SIGKILL、崩溃）可能留下锁：由同一 owner 运行 `unlock`，它按进程实例判断（PID 加进程启动时间）：只有持锁进程已退出、或该 PID 已被系统分给启动时间不同的新进程时才移除；无法比较时拒绝；不看命令行名称，也不按锁存在时长接管；移除后先核清上一次 `run` 最后一个动作的结果，再继续。获取、恢复和释放共用短时同步门闩，释放还核对本次 token。若遗留 `.transition`，不自动恢复；须确认该设备所有命令已停止，再人工移除门闩。升级前结束旧版本命令，不混用版本。
 - 临时计划创建时立即设置成功、失败、中断都执行的清理；保留持久证据。收尾执行 `stop` 并检查结果，失败时不能删除 lease 伪装释放。
@@ -143,7 +144,7 @@ node "$S" unlock --udid <UDID> --owner <任务名>    # 仅当命令被强杀留
 
 ## 6. 记录
 
-`run` 在本机状态目录追加一行 `runs.jsonl`（时间、UDID、owner、状态、每步类型和耗时、错误码）；不记输入的文字、截图或界面内容。状态目录：`$SIMOPS_STATE_DIR`，默认 `$XDG_STATE_HOME/browser-sim-ops` 或 `~/.local/state/browser-sim-ops`，不在仓库里。输出的最终摘要可能含敏感页面文字；不要把命令输出、计划、截图或本机状态公开。
+`run` 在本机状态目录追加一行 `runs.jsonl`（时间、UDID、owner、状态、每步类型和耗时、错误码）；自动收回无主占用时也记一行；不记输入的文字、截图或界面内容。状态目录：`$SIMOPS_STATE_DIR`，默认 `$XDG_STATE_HOME/browser-sim-ops` 或 `~/.local/state/browser-sim-ops`，不在仓库里。输出的最终摘要可能含敏感页面文字；不要把命令输出、计划、截图或本机状态公开。
 
 ## 7. 安装、调用、卸载、回退
 
